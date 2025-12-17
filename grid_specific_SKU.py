@@ -2,9 +2,12 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
+from folium.plugins import Draw
 from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from shapely.geometry import Point, Polygon, box
 
-st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v4")
+st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v6")
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 BOUNDS = {
@@ -28,7 +31,7 @@ def load_data():
         df['Building/Long'] = pd.to_numeric(df['Building/Long'], errors='coerce')
         df = df.dropna(subset=['Building/Lat', 'Building/Long'])
         
-        # 2. Status Cleaning - Normalize
+        # 2. Status Cleaning
         status_map = {
             '✅ Live': 'Live',
             'Live': 'Live',
@@ -54,7 +57,7 @@ def load_data():
         else:
             df['Clean_Price'] = 0.0
 
-        # 4. Config Cleaning (2BHK, 3BHK)
+        # 4. Config Cleaning
         df['BHK_Num'] = df['Home/Configuration'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
         
         return df
@@ -191,46 +194,106 @@ filtered_df = df_homes[
 base_grids = generate_7x7_matrix()
 ops_grids, all_grids_flat = process_grids(base_grids, filtered_df, split_threshold)
 
-# --- 6. UI: SELECTORS ---
-# We moved Selectors UP so they control the map view
+# --- 6. UI: MAIN CONTROL ---
 st.divider()
-c_sel1, c_sel2, c_search = st.columns([1, 1, 2])
 
-with c_sel1:
-    parent_grids = sorted([g.id for g in all_grids_flat if g.level == 1])
-    selected_parent = st.selectbox("Select Parent Grid", parent_grids)
+# MODE TOGGLE
+c_mode, c_search = st.columns([1, 2])
+with c_mode:
+    is_draw_mode = st.toggle("✨ Dynamic Search (Draw Mode)", value=False)
 
-with c_sel2:
-    possible_subs = [g.id for g in all_grids_flat if g.id.startswith(selected_parent) and g.id != selected_parent]
-    selected_sub = st.selectbox("Select Subgrid", ["All"] + sorted(possible_subs)) if possible_subs else "All"
+with c_search:
+    st.caption("Locate Landmark")
+    c_s1, c_s2 = st.columns([1, 2])
+    with c_s1: search_type = st.radio("Type", ["House ID", "Landmark"], label_visibility="collapsed")
+    with c_s2: query = st.text_input("Search", placeholder="e.g. JB-101 or Indiranagar", label_visibility="collapsed")
+    
+    search_loc = None
+    if query:
+        if search_type == "House ID":
+            mask = (
+                filtered_df['House_ID'].astype(str).str.contains(query, case=False) |
+                filtered_df['Building/Name'].astype(str).str.contains(query, case=False)
+            )
+            res = filtered_df[mask]
+            if not res.empty:
+                first = res.iloc[0]
+                search_loc = [first['Building/Lat'], first['Building/Long']]
+                st.toast(f"Found: {first['Building/Name']}")
+            else:
+                st.toast("No match found.")
+        else:
+            try:
+                geolocator = Nominatim(user_agent="jumbo_ops_app")
+                location = geolocator.geocode(f"{query}, Bangalore, India")
+                if location:
+                    search_loc = [location.latitude, location.longitude]
+                    st.toast(f"📍 {location.address}")
+            except:
+                pass
 
-target_id = selected_sub if selected_sub != "All" else selected_parent
-target_obj = next((g for g in all_grids_flat if g.id == target_id), None)
+# --- 7. GRID SELECTOR (ONLY IF DRAW MODE OFF) ---
+target_id = None
+target_obj = None
 
-# --- 7. MAP SECTION ---
+if not is_draw_mode:
+    c_sel1, c_sel2 = st.columns(2)
+    with c_sel1:
+        parent_grids = sorted([g.id for g in all_grids_flat if g.level == 1])
+        selected_parent = st.selectbox("Select Parent Grid", parent_grids)
+    with c_sel2:
+        possible_subs = [g.id for g in all_grids_flat if g.id.startswith(selected_parent) and g.id != selected_parent]
+        selected_sub = st.selectbox("Select Subgrid", ["All"] + sorted(possible_subs)) if possible_subs else "All"
+    
+    target_id = selected_sub if selected_sub != "All" else selected_parent
+    target_obj = next((g for g in all_grids_flat if g.id == target_id), None)
+else:
+    st.info("🎨 Drawing Mode Active: Use the toolbar on the left of the map to draw a Circle or Rectangle.")
+
+# --- 8. MAP SECTION ---
 c_map, c_data = st.columns([3, 2])
 
+# Logic for Custom Search Zone
+active_drawing = None
+
 with c_map:
-    # Logic to center map: on Search OR on Selected Grid
+    # 1. Base Map Center
     start_loc = [12.9716, 77.5946]
     zoom = 11
 
-    if target_obj:
+    if search_loc:
+        start_loc = search_loc
+        zoom = 13
+    elif target_obj and not is_draw_mode:
         start_loc = [(target_obj.min_lat + target_obj.max_lat)/2, (target_obj.min_lon + target_obj.max_lon)/2]
         zoom = 13 if target_obj.level > 1 else 12
 
     m = folium.Map(location=start_loc, zoom_start=zoom, prefer_canvas=True)
     
-    # Draw ALL Grids (Background)
+    # 2. Add Draw Control ONLY if Toggle is ON
+    if is_draw_mode:
+        draw = Draw(
+            draw_options={
+                'polyline': False,
+                'polygon': False, 
+                'rectangle': True,
+                'circle': True,
+                'marker': False,
+                'circlemarker': False
+            },
+            edit_options={'edit': False}
+        )
+        draw.add_to(m)
+
+    # 3. Draw Grids (Background Layer)
     for g in ops_grids:
-        # Highlight Selected Grid
-        is_selected = (g.id == target_id)
+        # Highlight Logic
+        is_selected = (g.id == target_id) and (not is_draw_mode)
         
         if g.level == 1: col, op = "#333", 0.05
         elif g.level == 2: col, op = "#ff9800", 0.15
         else: col, op = "#d32f2f", 0.25
         
-        # Override if selected
         if is_selected:
             col = "blue"
             op = 0.05
@@ -244,50 +307,75 @@ with c_map:
             tooltip=f"{g.id}",
             popup=folium.Popup(f"<b>{g.id}</b><br>Count: {g.total_supply}", max_width=100)
         ).add_to(m)
-
-        # Label
+        
         folium.Marker(
             location=[(g.min_lat + g.max_lat)/2, (g.min_lon + g.max_lon)/2],
             icon=folium.DivIcon(html=f'<div style="font-size:8px; color:{col}; font-weight:bold;">{g.id}</div>')
         ).add_to(m)
+    
+    if search_loc:
+        folium.Marker(search_loc, icon=folium.Icon(color="green", icon="star")).add_to(m)
 
-    # DRAW PINS for the SELECTED Grid (Restoring the "Look")
-    if target_obj and not target_obj.df_subset.empty:
-        # Group by building to avoid 50 overlapping pins
-        grp = target_obj.df_subset.groupby(['Building/Name', 'Building/Lat', 'Building/Long']).size().reset_index(name='count')
+    # 4. Render Map & Capture Drawing
+    output = st_folium(m, width="100%", height=600)
+
+# --- 9. DATA LOGIC ---
+
+final_data = pd.DataFrame()
+title_text = "Select a Grid"
+
+# A. DRAW MODE LOGIC
+if is_draw_mode and output and output['last_active_drawing']:
+    drawing = output['last_active_drawing']
+    geom_type = drawing['geometry']['type']
+    
+    if geom_type == 'Point': 
+        center = drawing['geometry']['coordinates'] # [lon, lat]
+        radius_m = drawing['properties']['radius']
         
-        for _, row in grp.iterrows():
-            folium.Marker(
-                location=[row['Building/Lat'], row['Building/Long']],
-                tooltip=f"{row['Building/Name']} ({row['count']})",
-                icon=folium.Icon(color="red", icon="home", prefix="fa")
-            ).add_to(m)
+        def is_in_circle(row):
+            dist = geodesic((row['Building/Lat'], row['Building/Long']), (center[1], center[0])).meters
+            return dist <= radius_m
+            
+        final_data = filtered_df[filtered_df.apply(is_in_circle, axis=1)]
+        title_text = "Custom Circle Zone"
+        
+    elif geom_type == 'Polygon': 
+        coords = drawing['geometry']['coordinates'][0]
+        lons = [p[0] for p in coords]
+        lats = [p[1] for p in coords]
+        mask = (
+            (filtered_df['Building/Lat'] >= min(lats)) & (filtered_df['Building/Lat'] <= max(lats)) &
+            (filtered_df['Building/Long'] >= min(lons)) & (filtered_df['Building/Long'] <= max(lons))
+        )
+        final_data = filtered_df[mask]
+        title_text = "Custom Box Zone"
 
-    st_folium(m, width="100%", height=600)
+# B. GRID MODE LOGIC
+elif not is_draw_mode and target_obj:
+    final_data = target_obj.df_subset.copy()
+    title_text = f"Grid: {target_id}"
 
-# --- 8. DATA TABLE SECTION ---
+# --- 10. DISPLAY TABLE ---
 with c_data:
-    st.markdown(f"### 📊 Inventory: `{target_id}`")
-
-    if target_obj and not target_obj.df_subset.empty:
-        data = target_obj.df_subset.copy()
-        
+    st.markdown(f"### 📊 Inventory: {title_text}")
+    
+    if not final_data.empty:
         # 1. SUMMARY MATRIX
-        pivot = data.groupby(['BHK_Num', 'Clean_Status']).size().unstack(fill_value=0)
+        pivot = final_data.groupby(['BHK_Num', 'Clean_Status']).size().unstack(fill_value=0)
         required_cols = ['Live', 'Inspection Pending', 'Catalogue Pending']
         for c in required_cols:
             if c not in pivot.columns: pivot[c] = 0
         
         pivot = pivot[required_cols]
-        # Rename Index (2.0 -> 2 BHK)
         pivot.index = pivot.index.map(lambda x: f"{int(x)} BHK")
         
         st.table(pivot)
 
-        # 2. TOUR LIST (DISPLAYED)
+        # 2. TOUR LIST
         st.markdown("#### 📋 Tour List")
         
-        tour_df = data[['House_ID', 'Building/Name', 'Clean_Status', 'BHK_Num', 'Clean_Price']].copy()
+        tour_df = final_data[['House_ID', 'Building/Name', 'Clean_Status', 'BHK_Num', 'Clean_Price']].copy()
         tour_df['BHK_Num'] = tour_df['BHK_Num'].astype(int).astype(str) + " BHK"
         tour_df = tour_df.sort_values(by=['Clean_Status', 'Clean_Price'])
         tour_df.columns = ['ID', 'Project', 'Status', 'Config', 'Price (L)']
@@ -297,6 +385,8 @@ with c_data:
             use_container_width=True,
             height=400
         )
-        
     else:
-        st.info("No active inventory here.")
+        if is_draw_mode:
+            st.info("Draw a shape on the map to see homes.")
+        else:
+            st.info("No active inventory here.")
