@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
-import math
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
-st.set_page_config(layout="wide", page_title="Jumbo Territory Planner")
+st.set_page_config(layout="wide", page_title="Jumbo Territory Planner v3")
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 BOUNDS = {
@@ -28,13 +29,22 @@ def load_data():
         df['Building/Long'] = pd.to_numeric(df['Building/Long'], errors='coerce')
         df = df.dropna(subset=['Building/Lat', 'Building/Long'])
         
-        # 2. Status Cleaning (Active Only)
-        valid_statuses = ['✅ Live', 'Inspection Pending', 'Catalogue Pending', 'Live', 'Inspection Pending', 'Catalogue Pending']
-        # Check if 'Internal/Status' exists, else assume all are active
+        # 2. Status Cleaning - Normalize
+        # We need specific statuses for the table later
+        status_map = {
+            '✅ Live': 'Live',
+            'Live': 'Live',
+            'Inspection Pending': 'Inspection Pending',
+            'Catalogue Pending': 'Catalogue Pending'
+        }
         if 'Internal/Status' in df.columns:
-            df = df[df['Internal/Status'].isin(valid_statuses)]
+            df['Clean_Status'] = df['Internal/Status'].map(status_map).fillna('Other')
+            # Filter for active only
+            df = df[df['Clean_Status'].isin(['Live', 'Inspection Pending', 'Catalogue Pending'])]
+        else:
+            df['Clean_Status'] = 'Live' # Fallback
             
-        # 3. Price Cleaning (For Sliders)
+        # 3. Price Cleaning
         def clean_price(val):
             try:
                 return float(str(val).replace('L', '').replace(',', '').strip())
@@ -47,7 +57,8 @@ def load_data():
         else:
             df['Clean_Price'] = 0.0
 
-        # 4. Config Cleaning (For 2BHK/3BHK counts)
+        # 4. Config Cleaning (2BHK, 3BHK)
+        # Extract number from string
         df['BHK_Num'] = df['Home/Configuration'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
         
         return df
@@ -61,7 +72,7 @@ df_homes = load_data()
 if df_homes is None:
     st.stop()
 
-# --- 3. GRID CLASS (RECURSIVE) ---
+# --- 3. GRID CLASS ---
 
 class OpsGrid:
     def __init__(self, grid_id, min_lat, min_lon, max_lat, max_lon, level=1):
@@ -71,53 +82,29 @@ class OpsGrid:
         self.max_lat = max_lat
         self.max_lon = max_lon
         self.level = level
-        
-        # Stats
-        self.buildings = set() # Unique Projects
+        self.buildings = set()
         self.total_supply = 0
-        self.bhk2_count = 0
-        self.bhk3_count = 0
-        self.price_stats = {"min": 0, "max": 0, "avg": 0}
         self.children = []
+        self.df_subset = pd.DataFrame() # Store reference to data
 
     def calculate_stats(self, df_subset):
+        self.df_subset = df_subset
         if df_subset.empty:
             return 0
             
-        # Unique Buildings
         if 'Building/Name' in df_subset.columns:
             self.buildings = set(df_subset['Building/Name'].unique())
         
-        # Counts
         self.total_supply = len(df_subset)
-        self.bhk2_count = len(df_subset[df_subset['BHK_Num'] == 2])
-        self.bhk3_count = len(df_subset[df_subset['BHK_Num'] == 3])
-        
-        # Price Stats
-        prices = df_subset['Clean_Price']
-        if not prices.empty:
-            self.price_stats = {
-                "min": prices.min(),
-                "max": prices.max(),
-                "avg": prices.mean()
-            }
-            
         return len(self.buildings)
 
     def split(self):
         mid_lat = (self.min_lat + self.max_lat) / 2
         mid_lon = (self.min_lon + self.max_lon) / 2
         
-        # Directions: NW, NE, SW, SE
-        # IDs append direction: e.g., JB-A01-NW
-        
-        # 1. North West (Top Left)
         nw = OpsGrid(f"{self.id}-NW", mid_lat, self.min_lon, self.max_lat, mid_lon, self.level + 1)
-        # 2. North East (Top Right)
         ne = OpsGrid(f"{self.id}-NE", mid_lat, mid_lon, self.max_lat, self.max_lon, self.level + 1)
-        # 3. South West (Bottom Left)
         sw = OpsGrid(f"{self.id}-SW", self.min_lat, self.min_lon, mid_lat, mid_lon, self.level + 1)
-        # 4. South East (Bottom Right)
         se = OpsGrid(f"{self.id}-SE", self.min_lat, mid_lon, mid_lat, self.max_lon, self.level + 1)
         
         self.children = [nw, ne, sw, se]
@@ -127,60 +114,47 @@ class OpsGrid:
 
 def generate_7x7_matrix():
     grids = []
-    
     lat_step = (BOUNDS["TOP_LAT"] - BOUNDS["BOTTOM_LAT"]) / GRID_ROWS
     lon_step = (BOUNDS["RIGHT_LON"] - BOUNDS["LEFT_LON"]) / GRID_COLS
-    
-    # X Axis: A to G
     x_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     
-    for r in range(GRID_ROWS): # 0 to 6
-        for c in range(GRID_COLS): # 0 to 6
-            # Calculate Bounds
-            # Lat: Starts Top, goes down. Row 0 is Top (13.35)
+    for r in range(GRID_ROWS): 
+        for c in range(GRID_COLS):
             g_max_lat = BOUNDS["TOP_LAT"] - (r * lat_step)
             g_min_lat = g_max_lat - lat_step
-            
-            # Lon: Starts Left, goes right. Col 0 is Left (77.25)
             g_min_lon = BOUNDS["LEFT_LON"] + (c * lon_step)
             g_max_lon = g_min_lon + lon_step
             
-            # ID: Row 0 -> '01', Row 6 -> '07'
-            # ID: Col 0 -> 'A', Col 6 -> 'G'
             grid_id = f"JB-{x_labels[c]}{str(r+1).zfill(2)}"
-            
             grids.append(OpsGrid(grid_id, g_min_lat, g_min_lon, g_max_lat, g_max_lon, level=1))
-            
     return grids
 
 def process_grids(base_grids, df, threshold):
     final_output = []
+    flat_list = [] # List of ALL grids (Parents + Children) for Dropdowns
     
     for grid in base_grids:
-        # 1. Filter Data for this Grid
         mask = (
             (df['Building/Lat'] >= grid.min_lat) & (df['Building/Lat'] < grid.max_lat) &
             (df['Building/Long'] >= grid.min_lon) & (df['Building/Long'] < grid.max_lon)
         )
         subset = df[mask]
-        
-        # 2. Calculate Stats
         b_count = grid.calculate_stats(subset)
+        flat_list.append(grid)
         
-        # 3. Split Check
         if b_count > threshold:
             children = grid.split()
+            processed_children = []
+            
             for child in children:
-                # Recursive Step (Level 2)
-                # Filter again for child
                 c_mask = (
                     (subset['Building/Lat'] >= child.min_lat) & (subset['Building/Lat'] < child.max_lat) &
                     (subset['Building/Long'] >= child.min_lon) & (subset['Building/Long'] < child.max_lon)
                 )
                 c_subset = subset[c_mask]
                 c_b_count = child.calculate_stats(c_subset)
+                flat_list.append(child)
                 
-                # Check Level 3 Split
                 if c_b_count > threshold:
                     grand_children = child.split()
                     for gc in grand_children:
@@ -189,148 +163,193 @@ def process_grids(base_grids, df, threshold):
                             (c_subset['Building/Long'] >= gc.min_lon) & (c_subset['Building/Long'] < gc.max_lon)
                         )
                         gc.calculate_stats(c_subset[gc_mask])
-                        final_output.append(gc) # Add L3
+                        processed_children.append(gc)
+                        flat_list.append(gc)
                 else:
-                    final_output.append(child) # Add L2
-        else:
-            final_output.append(grid) # Add L1
+                    processed_children.append(child)
             
-    return final_output
+            final_output.extend(processed_children)
+        else:
+            final_output.append(grid)
+            
+    return final_output, flat_list
 
-# --- 5. UI LAYOUT ---
+# --- 5. UI: SIDEBAR ---
 
-st.title("🗺️ Jumbo Homes: Operational Grid Planner")
+st.title("🗺️ Jumbo Homes: Operational Planner")
 
-# Sidebar / Top Bar
-c1, c2, c3 = st.columns([1, 1, 2])
+# A. Configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    split_threshold = st.number_input("Split Threshold (Buildings)", 10, 200, 50)
+    
+    st.divider()
+    
+    st.subheader("💰 Price Filter (Lakhs)")
+    price_options = [0, 20, 40, 60, 80, 100, 120, 150, 200, 300, 500, 1000]
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        min_price = st.selectbox("Min Price", price_options, index=0)
+    with c2:
+        max_price = st.selectbox("Max Price", price_options, index=len(price_options)-3)
+        
+    if min_price >= max_price:
+        st.error("⚠️ Min Price must be less than Max Price!")
+        st.stop()
+        
+    st.info(f"Showing homes between {min_price}L - {max_price}L")
 
-with c1:
-    st.caption("📍 Grid Boundaries (Fixed)")
-    st.text(f"NW: {BOUNDS['TOP_LAT']}, {BOUNDS['LEFT_LON']}")
-    st.text(f"SE: {BOUNDS['BOTTOM_LAT']}, {BOUNDS['RIGHT_LON']}")
-
-with c2:
-    split_threshold = st.number_input("✂️ Split Threshold (Buildings)", min_value=10, max_value=200, value=50)
-
-with c3:
-    # Price Filter Slider
-    min_p, max_p = int(df_homes['Clean_Price'].min()), int(df_homes['Clean_Price'].max())
-    price_range = st.slider("💰 Price Filter (Lakhs)", min_p, max_p, (min_p, max_p))
-
-# Apply Filter BEFORE processing grids
+# Apply Filter
 filtered_df = df_homes[
-    (df_homes['Clean_Price'] >= price_range[0]) & 
-    (df_homes['Clean_Price'] <= price_range[1])
+    (df_homes['Clean_Price'] >= min_price) & 
+    (df_homes['Clean_Price'] <= max_price)
 ]
 
-# Run Logic
+# Run Algo
 base_grids = generate_7x7_matrix()
-ops_grids = process_grids(base_grids, filtered_df, split_threshold)
+ops_grids, all_grids_flat = process_grids(base_grids, filtered_df, split_threshold)
 
-# --- 6. SEARCH & MAP ---
+# --- 6. UI: MAIN AREA ---
 
-st.divider()
-search_col, map_col = st.columns([1, 3])
+# A. Search Bar
+c_search, c_map = st.columns([1, 3])
 
-with search_col:
-    st.subheader("🔍 Search")
-    query = st.text_input("Find House ID, Project, or Locality", placeholder="e.g. JB-102 or Indiranagar")
+with c_search:
+    st.subheader("🔍 Find Location")
+    search_type = st.radio("Search By:", ["House ID / Project", "Landmark (OpenMap)"])
+    query = st.text_input("Enter Query", placeholder="e.g. JB-101 or Indiranagar")
     
-    search_result_loc = None
+    search_loc = None
     
     if query:
-        # Search Logic
-        mask = (
-            df_homes['House_ID'].astype(str).str.contains(query, case=False) |
-            df_homes['Building/Name'].astype(str).str.contains(query, case=False) |
-            df_homes['Building/Locality'].astype(str).str.contains(query, case=False)
-        )
-        results = df_homes[mask]
-        
-        if not results.empty:
-            st.success(f"Found {len(results)} matches")
-            # Pick first match to center map
-            first = results.iloc[0]
-            search_result_loc = [first['Building/Lat'], first['Building/Long']]
-            st.info(f"📍 {first['Building/Name']} ({first['House_ID']})")
+        if search_type == "House ID / Project":
+            mask = (
+                filtered_df['House_ID'].astype(str).str.contains(query, case=False) |
+                filtered_df['Building/Name'].astype(str).str.contains(query, case=False)
+            )
+            res = filtered_df[mask]
+            if not res.empty:
+                first = res.iloc[0]
+                search_loc = [first['Building/Lat'], first['Building/Long']]
+                st.success(f"Found: {first['Building/Name']}")
+            else:
+                st.warning("No match in database.")
+                
         else:
-            st.error("No matches found.")
+            # GEOPY SEARCH
+            try:
+                geolocator = Nominatim(user_agent="jumbo_ops_app")
+                # Append Bangalore for better context
+                location = geolocator.geocode(f"{query}, Bangalore, India")
+                if location:
+                    search_loc = [location.latitude, location.longitude]
+                    st.success(f"📍 {location.address}")
+                else:
+                    st.warning("Location not found on OpenStreetMap.")
+            except Exception as e:
+                st.error("Search Service Unavailable.")
 
-    st.markdown("### 📊 Territory Stats")
-    st.write(f"**Total Grids:** {len(ops_grids)}")
-    st.write(f"**Total Active Supply:** {len(filtered_df)}")
+# B. MAP
+with c_map:
+    center = search_loc if search_loc else [12.9716, 77.5946]
+    zoom = 13 if search_loc else 11
     
-    # Legend
-    st.markdown("""
-    <div style='background-color:#eee; padding:10px; border-radius:5px;'>
-    <b>Legend:</b><br>
-    ⬛ <b>Black:</b> L1 Parent (Sparse)<br>
-    🟧 <b>Orange:</b> L2 Zone (Active)<br>
-    🟥 <b>Red:</b> L3 Beat (Dense)
-    </div>
-    """, unsafe_allow_html=True)
-
-with map_col:
-    # Center map
-    start_loc = search_result_loc if search_result_loc else [12.9716, 77.5946]
-    zoom = 13 if search_result_loc else 11
-    
-    m = folium.Map(location=start_loc, zoom_start=zoom, prefer_canvas=True)
-    
-    # Draw Bounds Box
-    folium.Rectangle(
-        bounds=[[BOUNDS["TOP_LAT"], BOUNDS["LEFT_LON"]], [BOUNDS["BOTTOM_LAT"], BOUNDS["RIGHT_LON"]]],
-        color="blue", fill=False, weight=1, dash_array="5, 5"
-    ).add_to(m)
+    m = folium.Map(location=center, zoom_start=zoom, prefer_canvas=True)
     
     for g in ops_grids:
-        # Styling
+        # Coloring
         if g.level == 1:
-            col, w, op = "#333", 1, 0.05
+            col, op = "#333", 0.05
         elif g.level == 2:
-            col, w, op = "#ff9800", 2, 0.15
+            col, op = "#ff9800", 0.15
         else:
-            col, w, op = "#d32f2f", 2, 0.25
+            col, op = "#d32f2f", 0.25
             
-        # Tooltip Content
-        tooltip_html = f"""
-        <div style='font-family:sans-serif; width:180px;'>
-            <b>ID:</b> {g.id}<br>
-            <b>Level:</b> {g.level}<br>
-            <hr style='margin:5px 0;'>
-            <b>🏢 Buildings:</b> {len(g.buildings)}<br>
-            <b>🏠 Total Active:</b> {g.total_supply}<br>
-            • 2 BHK: {g.bhk2_count}<br>
-            • 3 BHK: {g.bhk3_count}<br>
-            <hr style='margin:5px 0;'>
-            <b>Price Range:</b><br>
-            {int(g.price_stats['min'])}L - {int(g.price_stats['max'])}L
-        </div>
-        """
-        
-        # Draw Grid
         folium.Rectangle(
             bounds=[[g.min_lat, g.min_lon], [g.max_lat, g.max_lon]],
-            color=col,
-            weight=w,
-            fill=True,
-            fill_opacity=op,
-            popup=folium.Popup(tooltip_html, max_width=250),
-            tooltip=f"{g.id} ({len(g.buildings)} Projects)"
+            color=col, weight=1, fill=True, fill_opacity=op,
+            tooltip=f"{g.id} ({len(g.buildings)} Projects)",
+            popup=folium.Popup(f"<b>ID: {g.id}</b><br>Supply: {g.total_supply}", max_width=100)
         ).add_to(m)
         
-        # Center Label
+        # Label
         folium.Marker(
             location=[(g.min_lat + g.max_lat)/2, (g.min_lon + g.max_lon)/2],
-            icon=folium.DivIcon(html=f'<div style="font-size:8px; font-weight:bold; color:{col};">{g.id}</div>')
+            icon=folium.DivIcon(html=f'<div style="font-size:8px; color:{col}; font-weight:bold;">{g.id}</div>')
         ).add_to(m)
+        
+    if search_loc:
+        folium.Marker(search_loc, icon=folium.Icon(color="green", icon="star")).add_to(m)
+        
+    st_folium(m, width="100%", height=600)
 
-    # If search result exists, add a marker
-    if search_result_loc:
-        folium.Marker(
-            location=search_result_loc,
-            icon=folium.Icon(color="green", icon="star"),
-            tooltip="Search Result"
-        ).add_to(m)
+# --- 7. DRILL DOWN TABLE ---
 
-    st_folium(m, width="100%", height=700)
+st.divider()
+st.subheader("📊 Grid Drill-Down")
+
+# Create Hierarchy Dict for Dropdowns
+# Structure: { 'JB-A01': ['JB-A01-NW', 'JB-A01-SE'...] }
+parent_grids = sorted([g.id for g in all_grids_flat if g.level == 1])
+subgrid_map = {g.id: [] for g in all_grids_flat}
+
+# Populate children map (simple string matching)
+for g in all_grids_flat:
+    if g.level > 1:
+        parent_id = g.id.rsplit('-', 1)[0]
+        # Handle L3 (Grandchildren) -> Find L1 Parent
+        # Actually simplest is just: If I select "JB-A01", show anything starting with "JB-A01"
+        pass 
+
+col_dd1, col_dd2, col_dd3 = st.columns([1, 1, 3])
+
+with col_dd1:
+    selected_parent = st.selectbox("Select Parent Grid", parent_grids)
+
+with col_dd2:
+    # Find all subgrids that start with the parent ID
+    possible_subs = [g.id for g in all_grids_flat if g.id.startswith(selected_parent) and g.id != selected_parent]
+    
+    if possible_subs:
+        selected_sub = st.selectbox("Select Subgrid (Optional)", ["All"] + sorted(possible_subs))
+    else:
+        selected_sub = "All"
+        st.caption("No subgrids defined.")
+
+# TABLE LOGIC
+target_id = selected_sub if selected_sub != "All" else selected_parent
+
+# Find the object corresponding to target_id
+target_obj = next((g for g in all_grids_flat if g.id == target_id), None)
+
+with col_dd3:
+    if target_obj and not target_obj.df_subset.empty:
+        st.markdown(f"**Inventory Status: {target_id}**")
+        
+        # Pivot Data
+        # Filter again just to be safe, though target_obj has it.
+        # However, target_obj.df_subset might include children if it's a parent.
+        # If we selected "All", we want the Parent's total data.
+        
+        data = target_obj.df_subset
+        
+        # Group by Status and BHK
+        pivot = data.groupby(['Clean_Status', 'BHK_Num']).size().unstack(fill_value=0)
+        
+        # Ensure columns exist (2.0 and 3.0)
+        if 2.0 not in pivot.columns: pivot[2.0] = 0
+        if 3.0 not in pivot.columns: pivot[3.0] = 0
+        
+        # Ensure rows exist
+        required_rows = ['Live', 'Inspection Pending', 'Catalogue Pending']
+        pivot = pivot.reindex(required_rows, fill_value=0)
+        
+        # Select only 2 and 3 BHK columns
+        display_table = pivot[[2.0, 3.0]].astype(int)
+        display_table.columns = ['2 BHK Count', '3 BHK Count']
+        
+        st.table(display_table)
+        
+    else:
+        st.info("No active inventory in this grid.")
