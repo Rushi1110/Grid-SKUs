@@ -7,7 +7,7 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from shapely.geometry import Point, Polygon, box
 
-st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v6")
+st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v7")
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 BOUNDS = {
@@ -248,7 +248,7 @@ if not is_draw_mode:
     target_id = selected_sub if selected_sub != "All" else selected_parent
     target_obj = next((g for g in all_grids_flat if g.id == target_id), None)
 else:
-    st.info("🎨 Drawing Mode Active: Use the toolbar on the left of the map to draw a Circle or Rectangle.")
+    st.info("🎨 Drawing Mode Active: The map is clear. Use the toolbar on the left of the map to draw a Circle or Rectangle.")
 
 # --- 8. MAP SECTION ---
 c_map, c_data = st.columns([3, 2])
@@ -285,33 +285,34 @@ with c_map:
         )
         draw.add_to(m)
 
-    # 3. Draw Grids (Background Layer)
-    for g in ops_grids:
-        # Highlight Logic
-        is_selected = (g.id == target_id) and (not is_draw_mode)
-        
-        if g.level == 1: col, op = "#333", 0.05
-        elif g.level == 2: col, op = "#ff9800", 0.15
-        else: col, op = "#d32f2f", 0.25
-        
-        if is_selected:
-            col = "blue"
-            op = 0.05
-            weight = 3
-        else:
-            weight = 1
+    # 3. Draw Grids (Background Layer) - ONLY IF DRAW MODE IS OFF
+    if not is_draw_mode:
+        for g in ops_grids:
+            # Highlight Logic
+            is_selected = (g.id == target_id)
+            
+            if g.level == 1: col, op = "#333", 0.05
+            elif g.level == 2: col, op = "#ff9800", 0.15
+            else: col, op = "#d32f2f", 0.25
+            
+            if is_selected:
+                col = "blue"
+                op = 0.05
+                weight = 3
+            else:
+                weight = 1
 
-        folium.Rectangle(
-            bounds=[[g.min_lat, g.min_lon], [g.max_lat, g.max_lon]],
-            color=col, weight=weight, fill=True, fill_opacity=op,
-            tooltip=f"{g.id}",
-            popup=folium.Popup(f"<b>{g.id}</b><br>Count: {g.total_supply}", max_width=100)
-        ).add_to(m)
-        
-        folium.Marker(
-            location=[(g.min_lat + g.max_lat)/2, (g.min_lon + g.max_lon)/2],
-            icon=folium.DivIcon(html=f'<div style="font-size:8px; color:{col}; font-weight:bold;">{g.id}</div>')
-        ).add_to(m)
+            folium.Rectangle(
+                bounds=[[g.min_lat, g.min_lon], [g.max_lat, g.max_lon]],
+                color=col, weight=weight, fill=True, fill_opacity=op,
+                tooltip=f"{g.id}",
+                popup=folium.Popup(f"<b>{g.id}</b><br>Count: {g.total_supply}", max_width=100)
+            ).add_to(m)
+            
+            folium.Marker(
+                location=[(g.min_lat + g.max_lat)/2, (g.min_lon + g.max_lon)/2],
+                icon=folium.DivIcon(html=f'<div style="font-size:8px; color:{col}; font-weight:bold;">{g.id}</div>')
+            ).add_to(m)
     
     if search_loc:
         folium.Marker(search_loc, icon=folium.Icon(color="green", icon="star")).add_to(m)
