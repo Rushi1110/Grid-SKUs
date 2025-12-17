@@ -7,18 +7,7 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from shapely.geometry import Point, Polygon, box
 
-st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v8")
-
-# --- 0. HIDE STREAMLIT HEADER & FOOTER ---
-hide_st_style = """
-            <style>
-            #MainMenu {visibility: hidden;}
-            footer {visibility: hidden;}
-            header {visibility: hidden;}
-            [data-testid="stToolbar"] {visibility: hidden;}
-            </style>
-            """
-st.markdown(hide_st_style, unsafe_allow_html=True)
+st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v9")
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 BOUNDS = {
@@ -71,7 +60,7 @@ def load_data():
         # 4. Config Cleaning
         df['BHK_Num'] = df['Home/Configuration'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
         
-        # 5. Facing Cleaning (Handle missing column gracefully)
+        # 5. Facing Cleaning
         if 'Home/Facing' in df.columns:
             df['Clean_Facing'] = df['Home/Facing'].fillna('Unknown').astype(str).str.strip()
         else:
@@ -193,7 +182,7 @@ with st.sidebar:
     
     st.divider()
     
-    # --- PRICE FILTER ---
+    # --- FILTERS ---
     st.subheader("💰 Filters")
     price_options = [0, 20, 40, 60, 80, 100, 120, 150, 200, 300, 500, 1000]
     c1, c2 = st.columns(2)
@@ -203,19 +192,15 @@ with st.sidebar:
         st.error("Min > Max")
         st.stop()
 
-    # --- NEW FILTERS ---
-    
     # 1. Configuration (BHK)
     available_bhk = sorted([int(x) for x in df_homes['BHK_Num'].unique() if x > 0])
     selected_bhk = st.multiselect("Configuration (BHK)", options=available_bhk, default=available_bhk)
     
     # 2. Facing
     available_facing = sorted(df_homes['Clean_Facing'].unique().tolist())
-    # Try to make sensible defaults (remove 'Unknown' from default if desired, or keep all)
-    default_facing = available_facing
-    selected_facing = st.multiselect("Home Facing", options=available_facing, default=default_facing)
+    selected_facing = st.multiselect("Home Facing", options=available_facing, default=available_facing)
 
-# --- APPLY ALL FILTERS ---
+# --- APPLY FILTERS ---
 filtered_df = df_homes[
     (df_homes['Clean_Price'] >= min_price) & 
     (df_homes['Clean_Price'] <= max_price) &
@@ -287,9 +272,6 @@ else:
 
 # --- 8. MAP SECTION ---
 c_map, c_data = st.columns([3, 2])
-
-# Logic for Custom Search Zone
-active_drawing = None
 
 with c_map:
     # 1. Base Map Center
@@ -419,7 +401,6 @@ with c_data:
         tour_df['BHK_Num'] = tour_df['BHK_Num'].astype(int).astype(str) + " BHK"
         tour_df = tour_df.sort_values(by=['Clean_Status', 'Clean_Price'])
         
-        # Rename columns for display
         rename_map = {
             'House_ID': 'ID', 
             'Building/Name': 'Project', 
