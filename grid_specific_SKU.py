@@ -3,9 +3,8 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 
-st.set_page_config(layout="wide", page_title="Jumbo Territory Planner v3")
+st.set_page_config(layout="wide", page_title="Jumbo Tour Planner")
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 BOUNDS = {
@@ -30,7 +29,6 @@ def load_data():
         df = df.dropna(subset=['Building/Lat', 'Building/Long'])
         
         # 2. Status Cleaning - Normalize
-        # We need specific statuses for the table later
         status_map = {
             '✅ Live': 'Live',
             'Live': 'Live',
@@ -42,7 +40,7 @@ def load_data():
             # Filter for active only
             df = df[df['Clean_Status'].isin(['Live', 'Inspection Pending', 'Catalogue Pending'])]
         else:
-            df['Clean_Status'] = 'Live' # Fallback
+            df['Clean_Status'] = 'Live' 
             
         # 3. Price Cleaning
         def clean_price(val):
@@ -58,7 +56,6 @@ def load_data():
             df['Clean_Price'] = 0.0
 
         # 4. Config Cleaning (2BHK, 3BHK)
-        # Extract number from string
         df['BHK_Num'] = df['Home/Configuration'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
         
         return df
@@ -85,7 +82,7 @@ class OpsGrid:
         self.buildings = set()
         self.total_supply = 0
         self.children = []
-        self.df_subset = pd.DataFrame() # Store reference to data
+        self.df_subset = pd.DataFrame() 
 
     def calculate_stats(self, df_subset):
         self.df_subset = df_subset
@@ -131,7 +128,7 @@ def generate_7x7_matrix():
 
 def process_grids(base_grids, df, threshold):
     final_output = []
-    flat_list = [] # List of ALL grids (Parents + Children) for Dropdowns
+    flat_list = [] 
     
     for grid in base_grids:
         mask = (
@@ -176,9 +173,8 @@ def process_grids(base_grids, df, threshold):
 
 # --- 5. UI: SIDEBAR ---
 
-st.title("🗺️ Jumbo Homes: Operational Planner")
+st.title("🗺️ Jumbo Homes: Tour Planner")
 
-# A. Configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
     split_threshold = st.number_input("Split Threshold (Buildings)", 10, 200, 50)
@@ -200,19 +196,16 @@ with st.sidebar:
         
     st.info(f"Showing homes between {min_price}L - {max_price}L")
 
-# Apply Filter
 filtered_df = df_homes[
     (df_homes['Clean_Price'] >= min_price) & 
     (df_homes['Clean_Price'] <= max_price)
 ]
 
-# Run Algo
 base_grids = generate_7x7_matrix()
 ops_grids, all_grids_flat = process_grids(base_grids, filtered_df, split_threshold)
 
 # --- 6. UI: MAIN AREA ---
 
-# A. Search Bar
 c_search, c_map = st.columns([1, 3])
 
 with c_search:
@@ -237,10 +230,8 @@ with c_search:
                 st.warning("No match in database.")
                 
         else:
-            # GEOPY SEARCH
             try:
                 geolocator = Nominatim(user_agent="jumbo_ops_app")
-                # Append Bangalore for better context
                 location = geolocator.geocode(f"{query}, Bangalore, India")
                 if location:
                     search_loc = [location.latitude, location.longitude]
@@ -250,7 +241,6 @@ with c_search:
             except Exception as e:
                 st.error("Search Service Unavailable.")
 
-# B. MAP
 with c_map:
     center = search_loc if search_loc else [12.9716, 77.5946]
     zoom = 13 if search_loc else 11
@@ -258,7 +248,6 @@ with c_map:
     m = folium.Map(location=center, zoom_start=zoom, prefer_canvas=True)
     
     for g in ops_grids:
-        # Coloring
         if g.level == 1:
             col, op = "#333", 0.05
         elif g.level == 2:
@@ -273,7 +262,6 @@ with c_map:
             popup=folium.Popup(f"<b>ID: {g.id}</b><br>Supply: {g.total_supply}", max_width=100)
         ).add_to(m)
         
-        # Label
         folium.Marker(
             location=[(g.min_lat + g.max_lat)/2, (g.min_lon + g.max_lon)/2],
             icon=folium.DivIcon(html=f'<div style="font-size:8px; color:{col}; font-weight:bold;">{g.id}</div>')
@@ -284,31 +272,20 @@ with c_map:
         
     st_folium(m, width="100%", height=600)
 
-# --- 7. DRILL DOWN TABLE ---
+# --- 7. DRILL DOWN & TOUR SHEET ---
 
 st.divider()
-st.subheader("📊 Grid Drill-Down")
+st.subheader("📊 Grid Drill-Down & Tour Generation")
 
-# Create Hierarchy Dict for Dropdowns
-# Structure: { 'JB-A01': ['JB-A01-NW', 'JB-A01-SE'...] }
 parent_grids = sorted([g.id for g in all_grids_flat if g.level == 1])
 subgrid_map = {g.id: [] for g in all_grids_flat}
 
-# Populate children map (simple string matching)
-for g in all_grids_flat:
-    if g.level > 1:
-        parent_id = g.id.rsplit('-', 1)[0]
-        # Handle L3 (Grandchildren) -> Find L1 Parent
-        # Actually simplest is just: If I select "JB-A01", show anything starting with "JB-A01"
-        pass 
-
-col_dd1, col_dd2, col_dd3 = st.columns([1, 1, 3])
+col_dd1, col_dd2 = st.columns([1, 1])
 
 with col_dd1:
     selected_parent = st.selectbox("Select Parent Grid", parent_grids)
 
 with col_dd2:
-    # Find all subgrids that start with the parent ID
     possible_subs = [g.id for g in all_grids_flat if g.id.startswith(selected_parent) and g.id != selected_parent]
     
     if possible_subs:
@@ -317,39 +294,51 @@ with col_dd2:
         selected_sub = "All"
         st.caption("No subgrids defined.")
 
-# TABLE LOGIC
 target_id = selected_sub if selected_sub != "All" else selected_parent
-
-# Find the object corresponding to target_id
 target_obj = next((g for g in all_grids_flat if g.id == target_id), None)
 
-with col_dd3:
-    if target_obj and not target_obj.df_subset.empty:
-        st.markdown(f"**Inventory Status: {target_id}**")
+st.markdown(f"### Inventory for: `{target_id}`")
+
+if target_obj and not target_obj.df_subset.empty:
+    data = target_obj.df_subset.copy()
+    
+    # 1. PREPARE DISPLAY MATRIX (Rows=BHK, Cols=Status)
+    pivot = data.groupby(['BHK_Num', 'Clean_Status']).size().unstack(fill_value=0)
+    
+    required_cols = ['Live', 'Inspection Pending', 'Catalogue Pending']
+    for c in required_cols:
+        if c not in pivot.columns: pivot[c] = 0
+            
+    pivot = pivot[required_cols] # Reorder columns
+    pivot = pivot.loc[[2.0, 3.0]] if 2.0 in pivot.index or 3.0 in pivot.index else pivot
+    pivot.index.name = "BHK Type"
+    
+    c_table, c_download = st.columns([2, 1])
+    
+    with c_table:
+        st.table(pivot.style.format("{:.0f}"))
         
-        # Pivot Data
-        # Filter again just to be safe, though target_obj has it.
-        # However, target_obj.df_subset might include children if it's a parent.
-        # If we selected "All", we want the Parent's total data.
+    with c_download:
+        st.markdown("#### 📥 Tour Sheet")
+        st.write("Download the list of all homes in this grid to plan your route.")
         
-        data = target_obj.df_subset
+        # Prepare Download CSV
+        tour_df = data[['House_ID', 'Building/Name', 'Clean_Status', 'BHK_Num', 'Clean_Price', 'Building/Lat', 'Building/Long']].copy()
         
-        # Group by Status and BHK
-        pivot = data.groupby(['Clean_Status', 'BHK_Num']).size().unstack(fill_value=0)
+        # Add Google Maps Link
+        tour_df['Maps_Link'] = tour_df.apply(lambda row: f"https://www.google.com/maps/search/?api=1&query={row['Building/Lat']},{row['Building/Long']}", axis=1)
         
-        # Ensure columns exist (2.0 and 3.0)
-        if 2.0 not in pivot.columns: pivot[2.0] = 0
-        if 3.0 not in pivot.columns: pivot[3.0] = 0
+        # Sort by Status then Price
+        tour_df = tour_df.sort_values(by=['Clean_Status', 'Clean_Price'])
         
-        # Ensure rows exist
-        required_rows = ['Live', 'Inspection Pending', 'Catalogue Pending']
-        pivot = pivot.reindex(required_rows, fill_value=0)
+        csv = tour_df.to_csv(index=False).encode('utf-8')
         
-        # Select only 2 and 3 BHK columns
-        display_table = pivot[[2.0, 3.0]].astype(int)
-        display_table.columns = ['2 BHK Count', '3 BHK Count']
+        st.download_button(
+            label="Download Tour Sheet (CSV)",
+            data=csv,
+            file_name=f"Tour_Sheet_{target_id}.csv",
+            mime='text/csv',
+        )
         
-        st.table(display_table)
-        
-    else:
-        st.info("No active inventory in this grid.")
+else:
+    st.info("No active inventory in this grid matching your filters.")
