@@ -18,7 +18,7 @@ BOUNDS = {
 GRID_ROWS = 7
 GRID_COLS = 7
 
-# --- 2. DATA LOADING (Cached) ---
+# --- 2. DATA LOADING (Cached & Robust) ---
 @st.cache_data
 def load_data():
     try:
@@ -29,15 +29,18 @@ def load_data():
         df['Building/Long'] = pd.to_numeric(df['Building/Long'], errors='coerce')
         df = df.dropna(subset=['Building/Lat', 'Building/Long'])
         
-        # 2. Status Cleaning & Mapping
-        status_map = {
-            '✅ Live': 'Live', 
-            'Live': 'Live',
-            'Inspection Pending': 'Inspection Pending',
-            'Catalogue Pending': 'Catalogue Pending'
-        }
+        # 2. Status Cleaning (Handle Emojis & Variations)
+        def clean_status_str(val):
+            val = str(val).lower()
+            if 'live' in val: return 'Live'
+            if 'sold' in val: return 'Sold'
+            if 'on hold' in val: return 'On Hold'
+            if 'inspection' in val: return 'Inspection Pending'
+            if 'catalogue' in val or 'catalog' in val: return 'Catalogue Pending'
+            return 'Other'
+
         if 'Internal/Status' in df.columns:
-            df['Clean_Status'] = df['Internal/Status'].map(status_map).fillna('Other')
+            df['Clean_Status'] = df['Internal/Status'].apply(clean_status_str)
         else:
             df['Clean_Status'] = 'Live' 
             
@@ -119,7 +122,7 @@ class OpsGrid:
         
         return [nw, ne, sw, se]
 
-# --- 4. CACHED GRID CALCULATOR ---
+# --- 4. CACHED GRID CALCULATOR (With Safety Guard) ---
 # This runs only when Filters or Thresholds change. Not on Zoom.
 @st.cache_data
 def process_grids(df, threshold, prem_val):
@@ -142,6 +145,9 @@ def process_grids(df, threshold, prem_val):
     final_output = []
     queue = grids
     
+    # SAFETY: Stop splitting if we go deeper than 6 levels to prevent infinite loops
+    MAX_LEVEL = 6 
+    
     while queue:
         grid = queue.pop(0)
         
@@ -155,8 +161,8 @@ def process_grids(df, threshold, prem_val):
         # Calculate Stats (Pass the Premium Threshold here!)
         count = grid.calculate_stats(subset, prem_threshold=prem_val)
         
-        if count > threshold:
-            # If too many homes, split it
+        if count > threshold and grid.level < MAX_LEVEL:
+            # If too many homes and not too deep, split it
             children = grid.split()
             queue.extend(children)
         else:
@@ -214,7 +220,7 @@ def generate_map(_grids, center, zoom):
             bounds=[[g.min_lat, g.min_lon], [g.max_lat, g.max_lon]],
             color=col, weight=1, fill=True, fill_opacity=op,
             tooltip=f"{g.id} (Homes: {g.total_supply})",
-            popup=folium.Popup(popup_html, max_width=200)
+            popup=folium.Popup(popup_html, max_width=220)
         ).add_to(m)
         
         # Grid Label
@@ -246,7 +252,8 @@ with st.sidebar:
     
     # Status Filter
     st.subheader("📋 Status")
-    status_options = ['Live', 'Inspection Pending', 'Catalogue Pending', 'Other']
+    # Matches the 'clean_status_str' logic
+    status_options = ['Live', 'Inspection Pending', 'Catalogue Pending', 'Sold', 'On Hold', 'Other']
     default_status = ['Live', 'Inspection Pending', 'Catalogue Pending']
     selected_status = st.multiselect("Select Status", status_options, default=default_status)
     
@@ -279,7 +286,6 @@ st.sidebar.info(f"Active Inventory: {len(filtered_df)}")
 
 # --- PROCESS GRIDS ---
 # This uses the CACHED function. 
-# It passes 'prem_threshold' so if you change 100L -> 120L, it recalculates.
 ops_grids = process_grids(filtered_df, split_threshold, prem_threshold)
 
 # --- MAP RENDER ---
