@@ -4,9 +4,10 @@ import folium
 from streamlit_folium import st_folium
 from folium.plugins import Draw
 from geopy.distance import geodesic
+from collections import deque  # Required for crash-free loop
 
 # --- 1. CONFIGURATION & PAGE SETUP ---
-st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v10")
+st.set_page_config(layout="wide", page_title="Jumbo Tour Planner v11")
 
 # Constants for the Grid System
 BOUNDS = {
@@ -18,7 +19,7 @@ BOUNDS = {
 GRID_ROWS = 7
 GRID_COLS = 7
 
-# --- 2. DATA LOADING (Cached & Robust) ---
+# --- 2. DATA LOADING (Cached) ---
 @st.cache_data
 def load_data():
     try:
@@ -47,7 +48,6 @@ def load_data():
         # 3. Price Cleaning
         def clean_price(val):
             try:
-                # Remove 'L', commas, and spaces, then convert to float
                 return float(str(val).replace('L', '').replace(',', '').strip())
             except:
                 return 0.0
@@ -58,10 +58,10 @@ def load_data():
         else:
             df['Clean_Price'] = 0.0
 
-        # 4. Config Cleaning (Extract number from "2 BHK")
+        # 4. Config Cleaning
         df['BHK_Num'] = df['Home/Configuration'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
         
-        # 5. Locality Handling (Fallback to Building Name if Locality missing)
+        # 5. Locality Handling
         if 'Locality' not in df.columns:
             if 'Building/Locality' in df.columns:
                 df['Locality'] = df['Building/Locality']
@@ -83,25 +83,26 @@ class OpsGrid:
         self.max_lon = max_lon
         self.level = level
         self.total_supply = 0
-        self.stats = {} # Holds the breakdown data
+        self.unique_buildings = 0
+        self.stats = {} 
         self.df_subset = pd.DataFrame() 
 
     def calculate_stats(self, df_subset, prem_threshold=100):
         self.df_subset = df_subset
         self.total_supply = len(df_subset)
         
+        # KEY CHANGE: We calculate unique buildings count here
+        self.unique_buildings = df_subset['Building/Name'].nunique() if not df_subset.empty else 0
+        
         if self.total_supply > 0:
-            # Logic Helpers
-            unique_bldgs = df_subset['Building/Name'].nunique()
             is_2bhk = df_subset['BHK_Num'] == 2
             is_3bhk = df_subset['BHK_Num'] == 3
-            is_tail = ~df_subset['BHK_Num'].isin([2, 3]) # Anything not 2 or 3
+            is_tail = ~df_subset['BHK_Num'].isin([2, 3])
             is_prem = df_subset['Clean_Price'] > prem_threshold
             is_budg = df_subset['Clean_Price'] <= prem_threshold
 
-            # Populate Stats Dictionary
             self.stats = {
-                'Buildings': unique_bldgs,
+                'Buildings': self.unique_buildings,
                 '2BHK_Budg': len(df_subset[is_2bhk & is_budg]),
                 '2BHK_Prem': len(df_subset[is_2bhk & is_prem]),
                 '3BHK_Budg': len(df_subset[is_3bhk & is_budg]),
@@ -109,7 +110,7 @@ class OpsGrid:
                 'Tail': len(df_subset[is_tail])
             }
         
-        return self.total_supply
+        return self.unique_buildings # Return BUILDING count for split logic
 
     def split(self):
         mid_lat = (self.min_lat + self.max_lat) / 2
@@ -122,9 +123,8 @@ class OpsGrid:
         
         return [nw, ne, sw, se]
 
-# --- 4. CACHED GRID CALCULATOR (With Safety Guard) ---
-# This runs only when Filters or Thresholds change. Not on Zoom.
-@st.cache_data
+# --- 4. GRID CALCULATOR (Fixed: No Cache & Building Logic) ---
+# REMOVED @st.cache_data to prevent "Oh no" memory crash
 def process_grids(df, threshold, prem_val):
     # A. Generate Base 7x7 Grids
     grids = []
@@ -143,36 +143,31 @@ def process_grids(df, threshold, prem_val):
 
     # B. Recursive Processing
     final_output = []
-    queue = grids
-    
-    # SAFETY: Stop splitting if we go deeper than 6 levels to prevent infinite loops
+    queue = deque(grids) # Use deque for safety
     MAX_LEVEL = 6 
     
     while queue:
-        grid = queue.pop(0)
+        grid = queue.popleft()
         
-        # Filter Data for this specific grid box
         mask = (
             (df['Building/Lat'] >= grid.min_lat) & (df['Building/Lat'] < grid.max_lat) &
             (df['Building/Long'] >= grid.min_lon) & (df['Building/Long'] < grid.max_lon)
         )
         subset = df[mask]
         
-        # Calculate Stats (Pass the Premium Threshold here!)
-        count = grid.calculate_stats(subset, prem_threshold=prem_val)
+        # Calculates stats and returns UNIQUE BUILDING count
+        bldg_count = grid.calculate_stats(subset, prem_threshold=prem_val)
         
-        if count > threshold and grid.level < MAX_LEVEL:
-            # If too many homes and not too deep, split it
+        # LOGIC: Split only if unique buildings > threshold
+        if bldg_count > threshold and grid.level < MAX_LEVEL:
             children = grid.split()
             queue.extend(children)
         else:
-            # Add to final list
             final_output.append(grid)
             
     return final_output
 
-# --- 5. CACHED MAP GENERATOR ---
-# This generates the Folium object. Only reruns if grids change.
+# --- 5. MAP GENERATOR (Cached) ---
 @st.cache_resource
 def generate_map(_grids, center, zoom):
     m = folium.Map(location=center, zoom_start=zoom, prefer_canvas=True)
@@ -245,14 +240,13 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # Thresholds
-    split_threshold = st.number_input("Grid Split Threshold (Homes)", 10, 500, 50)
-    prem_threshold = st.number_input("Premium Threshold (Lacs)", value=100, step=10, help="Prices ABOVE this are Premium. EQUAL or BELOW are Budget.")
+    split_threshold = st.number_input("Grid Split Threshold (Buildings)", 5, 200, 25, help="Splits grid if more than X unique buildings exist.")
+    prem_threshold = st.number_input("Premium Threshold (Lacs)", value=100, step=10, help="Prices ABOVE this are Premium.")
     
     st.divider()
     
     # Status Filter
     st.subheader("📋 Status")
-    # Matches the 'clean_status_str' logic
     status_options = ['Live', 'Inspection Pending', 'Catalogue Pending', 'Sold', 'On Hold', 'Other']
     default_status = ['Live', 'Inspection Pending', 'Catalogue Pending']
     selected_status = st.multiselect("Select Status", status_options, default=default_status)
@@ -279,25 +273,21 @@ filtered_df = df_homes[
     (df_homes['Clean_Status'].isin(selected_status))
 ].copy()
 
-# Apply Dynamic Budget/Premium Segment
 filtered_df['Segment'] = filtered_df['Clean_Price'].apply(lambda x: 'Prem' if x > prem_threshold else 'Budg')
 
 st.sidebar.info(f"Active Inventory: {len(filtered_df)}")
 
 # --- PROCESS GRIDS ---
-# This uses the CACHED function. 
+# Runs dynamically (Fast because logic is optimized)
 ops_grids = process_grids(filtered_df, split_threshold, prem_threshold)
 
 # --- MAP RENDER ---
 is_draw_mode = st.toggle("✨ Draw Mode (Polygon/Circle)", value=False)
-
 start_loc = [12.9716, 77.5946]
 zoom = 11
 
-# Generate map (Cached)
 m_static = generate_map(ops_grids, start_loc, zoom)
 
-# Add Draw control dynamically
 if is_draw_mode:
     draw = Draw(
         draw_options={'rectangle': True, 'circle': True, 'polyline': False, 'polygon': False, 'marker': False, 'circlemarker': False},
@@ -311,7 +301,6 @@ output = st_folium(m_static, width="100%", height=500)
 final_df_for_table = pd.DataFrame()
 current_selection_name = "All Visible Grids"
 
-# 1. Determine Data Source (Draw vs Grid)
 if is_draw_mode and output and output['last_active_drawing']:
     drawing = output['last_active_drawing']
     geom_type = drawing['geometry']['type']
@@ -319,7 +308,6 @@ if is_draw_mode and output and output['last_active_drawing']:
     if geom_type == 'Point': 
         center = drawing['geometry']['coordinates']
         radius_m = drawing['properties']['radius']
-        # Simple distance check
         filtered_df['dist'] = filtered_df.apply(lambda row: geodesic((row['Building/Lat'], row['Building/Long']), (center[1], center[0])).meters, axis=1)
         final_df_for_table = filtered_df[filtered_df['dist'] <= radius_m].copy()
         current_selection_name = "Custom Circle Zone"
@@ -335,7 +323,6 @@ if is_draw_mode and output and output['last_active_drawing']:
         final_df_for_table = filtered_df[mask].copy()
         current_selection_name = "Custom Box Zone"
 else:
-    # Combine data from all active OpsGrids
     frames = []
     for g in ops_grids:
         if not g.df_subset.empty:
@@ -345,21 +332,17 @@ else:
     if frames:
         final_df_for_table = pd.concat(frames)
 
-# 2. Build the Matrix Table
+# --- MATRIX TABLE ---
 st.divider()
 st.markdown(f"### 📊 Inventory Matrix: {current_selection_name}")
 
 if not final_df_for_table.empty:
-    
-    # Helper columns for Pivot
     final_df_for_table['Is_2BHK'] = final_df_for_table['BHK_Num'] == 2
     final_df_for_table['Is_3BHK'] = final_df_for_table['BHK_Num'] == 3
     final_df_for_table['Is_Tail'] = ~final_df_for_table['BHK_Num'].isin([2, 3])
     
-    # Grouping Level
     group_cols = ['Grid_ID', 'Locality'] if 'Grid_ID' in final_df_for_table.columns else ['Locality']
     
-    # Determine what we are counting (Buildings or Houses)
     if metric_type == "Show Building Count":
         agg_func = lambda x: x.nunique()
         val_col = 'Building/Name'
@@ -374,38 +357,19 @@ if not final_df_for_table.empty:
             mask = (final_df_for_table[mask_col])
         return final_df_for_table[mask].groupby(group_cols)[val_col].apply(agg_func)
 
-    # Calculate Columns
-    s_2bhk_budg = get_pivot_col('Is_2BHK', 'Budg')
-    s_2bhk_prem = get_pivot_col('Is_2BHK', 'Prem')
-    s_3bhk_budg = get_pivot_col('Is_3BHK', 'Budg')
-    s_3bhk_prem = get_pivot_col('Is_3BHK', 'Prem')
-    s_tail      = get_pivot_col('Is_Tail')
-    
-    # Unique Buildings is ALWAYS a building count, regardless of switch
-    s_unique_bldgs = final_df_for_table.groupby(group_cols)['Building/Name'].nunique()
-
-    # Combine
     display_df = pd.DataFrame({
-        '2BHK (Budg)': s_2bhk_budg,
-        '2BHK (Prem)': s_2bhk_prem,
-        '3BHK (Budg)': s_3bhk_budg,
-        '3BHK (Prem)': s_3bhk_prem,
-        'Tail': s_tail,
-        'Unique Bldgs': s_unique_bldgs
+        '2BHK (Budg)': get_pivot_col('Is_2BHK', 'Budg'),
+        '2BHK (Prem)': get_pivot_col('Is_2BHK', 'Prem'),
+        '3BHK (Budg)': get_pivot_col('Is_3BHK', 'Budg'),
+        '3BHK (Prem)': get_pivot_col('Is_3BHK', 'Prem'),
+        'Tail': get_pivot_col('Is_Tail'),
+        'Unique Bldgs': final_df_for_table.groupby(group_cols)['Building/Name'].nunique()
     }).fillna(0).astype(int)
     
-    # Sort
     if 'Grid_ID' in final_df_for_table.columns:
         display_df = display_df.sort_index(level=0)
 
-    # Display with merged index (Grid -> Locality)
-    st.dataframe(
-        display_df.style
-        .background_gradient(cmap="Reds", subset=['Unique Bldgs'])
-        .format("{:,}"),
-        use_container_width=True,
-        height=600
-    )
+    st.dataframe(display_df.style.background_gradient(cmap="Reds", subset=['Unique Bldgs']).format("{:,}"), use_container_width=True, height=600)
 
 else:
     st.warning("No data found for the current selection/filters.")
